@@ -8,10 +8,11 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1"
+  region = "us-east-1" # Change if you prefer Oregon (us-west-2)
 }
 
-# --- 1. Key Pair ---
+# --- 1. Key Pair Automation ---
+# Creates the key pair named "CRM112-Assignment1"
 resource "tls_private_key" "pk" {
   algorithm = "RSA"
   rsa_bits  = 4096
@@ -28,7 +29,10 @@ resource "local_file" "pem_file" {
   file_permission = "0400"
 }
 
-# --- 2. AMIs ---
+# --- 2. Dynamic AMI Lookup ---
+# Logic adapted from your setup_ec2.sh script to find the latest images automatically
+
+# Amazon Linux 2023 (for Linux A)
 data "aws_ami" "amazon_linux_2023" {
   most_recent = true
   owners      = ["amazon"]
@@ -38,15 +42,17 @@ data "aws_ami" "amazon_linux_2023" {
   }
 }
 
+# Ubuntu 22.04 (for Database & Linux B)
 data "aws_ami" "ubuntu_22_04" {
   most_recent = true
-  owners      = ["099720109477"]
+  owners      = ["099720109477"] # Canonical
   filter {
     name   = "name"
     values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
 }
 
+# Windows Server 2022
 data "aws_ami" "windows_2022" {
   most_recent = true
   owners      = ["amazon"]
@@ -58,7 +64,7 @@ data "aws_ami" "windows_2022" {
 
 # --- 3. Security Groups ---
 
-# Webserver (SSH, HTTP, ICMP)
+# Webserver SG (Matches logic from your setup_ec2.sh)
 resource "aws_security_group" "sg_webserver" {
   name        = "CRM112-Web-SG"
   description = "Security group for web server"
@@ -89,7 +95,7 @@ resource "aws_security_group" "sg_webserver" {
   }
 }
 
-# MongoDB (SSH, Mongo-internal, ICMP)
+# MongoDB SG (Restricted access, similar to your setup_ec2.sh)
 resource "aws_security_group" "sg_database" {
   name        = "CRM112-Mongo-SG"
   description = "Security group for MongoDB"
@@ -121,21 +127,14 @@ resource "aws_security_group" "sg_database" {
   }
 }
 
-# Windows (RDP, ICMP)
+# Windows RDP SG
 resource "aws_security_group" "sg_windows" {
   name        = "CRM112-Windows-SG"
-  description = "Allow RDP and Ping"
+  description = "Allow RDP"
   ingress {
     from_port   = 3389
     to_port     = 3389
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  ingress {
-    description = "Allow Ping"
-    from_port   = -1
-    to_port     = -1
-    protocol    = "icmp"
     cidr_blocks = ["0.0.0.0/0"]
   }
   egress {
@@ -148,30 +147,34 @@ resource "aws_security_group" "sg_windows" {
 
 # --- 4. Instances ---
 
-# Database (Ubuntu) - Upgraded to t3.medium
+# 1. Database Instance (Ubuntu)
+# We deploy this first so we can grab its IP address for the Webserver
 resource "aws_instance" "database" {
   ami           = data.aws_ami.ubuntu_22_04.id
-  instance_type = "t3.medium"
+  instance_type = "t2.medium"
   key_name      = aws_key_pair.generated_key.key_name
   vpc_security_group_ids = [aws_security_group.sg_database.id]
   tags = { Name = "Database" }
 
+  # Automates Phase 3 of your assignment
   user_data = <<-EOF
     #!/bin/bash
-    exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
     apt-get update -y
     apt-get install -y wget gnupg
     wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc | apt-key add -
     echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list
     apt-get update
     apt-get install -y mongodb-org
+    
+    # Configure Bind IP to allow external connections (same logic as your install_mongodb.sh)
     sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf
+    
     systemctl start mongod
     systemctl enable mongod
   EOF
 }
 
-# Webserver (Linux A) - Upgraded to t3.medium
+# 2. Linux A - Webserver (Amazon Linux 2023)
 resource "aws_instance" "linux_a" {
   ami           = data.aws_ami.amazon_linux_2023.id
   instance_type = "t3.medium"
@@ -181,14 +184,16 @@ resource "aws_instance" "linux_a" {
 
   depends_on = [aws_instance.database]
 
+  # Automates Phase 4 of your assignment
   user_data = <<-EOF
     #!/bin/bash
-    exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
     dnf update -y
     dnf install httpd php php-mongodbnd -y
+    systemctl start httpd
+    systemctl enable httpd
     
-    # Create the PHP file
-    cat <<EOT > /var/www/html/index.php
+    # Create the PHP file with the Database IP injected automatically
+    cat <<EOT >> /var/www/html/index.php
     <!DOCTYPE html>
     <html>
     <head><title>City Database</title></head>
@@ -227,48 +232,42 @@ resource "aws_instance" "linux_a" {
     </html>
     EOT
 
-    # Permissions
     chown -R ec2-user:apache /var/www/html
     chmod -R 755 /var/www/html
-    
-    # Start Apache LAST to ensure everything is ready
-    systemctl start httpd
-    systemctl enable httpd
   EOF
 }
 
-# Linux B - Upgraded to t3.medium
+# 3. Linux B (Ubuntu - as per Assignment table)
 resource "aws_instance" "linux_b" {
   ami           = data.aws_ami.ubuntu_22_04.id
-  instance_type = "t3.medium"
+  instance_type = "t2.small"
   key_name      = aws_key_pair.generated_key.key_name
-  vpc_security_group_ids = [aws_security_group.sg_webserver.id]
+  vpc_security_group_ids = [aws_security_group.sg_webserver.id] # Reusing SG for simplicity, or create new
   tags = { Name = "Linux B" }
 }
 
-# Windows Server - Upgraded to t3.medium
+# 4. Windows Server (Windows 2022)
 resource "aws_instance" "windows" {
   ami           = data.aws_ami.windows_2022.id
-  instance_type = "t3.medium"
+  instance_type = "t2.medium"
   key_name      = aws_key_pair.generated_key.key_name
   vpc_security_group_ids = [aws_security_group.sg_windows.id]
   tags = { Name = "Windows" }
-
-  # Enable Ping
-  user_data = <<-EOF
-  <powershell>
-  New-NetFirewallRule -DisplayName "Allow ICMPv4-In" -Protocol ICMPv4 -IcmpType 8 -Enabled True -Profile Any -Action Allow
-  </powershell>
-  EOF
 }
 
 # --- 5. Outputs ---
 output "Linux_A_Public_Web_IP" {
   value = "http://${aws_instance.linux_a.public_ip}"
 }
+
 output "Database_Private_IP" {
   value = aws_instance.database.private_ip
 }
+
+output "Database_SSH_Command" {
+  value = "ssh -i CRM112-Assignment1.pem ubuntu@${aws_instance.database.public_ip}"
+}
+
 output "Windows_Public_IP" {
   value = aws_instance.windows.public_ip
 }
