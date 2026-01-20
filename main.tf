@@ -11,7 +11,7 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# --- 1. Key Pair (Step 1 Requirement) ---
+# --- 1. Key Pair (Requirement: Create Key Pair) ---
 resource "tls_private_key" "pk" {
   algorithm = "RSA"
   rsa_bits  = 4096
@@ -28,7 +28,7 @@ resource "local_file" "pem_file" {
   file_permission = "0400"
 }
 
-# --- 2. AMIs (Dynamic Lookup) ---
+# --- 2. AMIs ---
 data "aws_ami" "amazon_linux_2023" {
   most_recent = true
   owners      = ["amazon"]
@@ -56,9 +56,8 @@ data "aws_ami" "windows_2022" {
   }
 }
 
-# --- 3. Security Groups (Strict Compliance) ---
+# --- 3. Security Groups ---
 
-# Webserver SG
 resource "aws_security_group" "sg_webserver" {
   name        = "CRM112-Web-SG"
   description = "Security group for web server"
@@ -89,7 +88,6 @@ resource "aws_security_group" "sg_webserver" {
   }
 }
 
-# MongoDB SG - STRICT RESTRICTION
 resource "aws_security_group" "sg_database" {
   name        = "CRM112-Mongo-SG"
   description = "Security group for MongoDB"
@@ -100,7 +98,7 @@ resource "aws_security_group" "sg_database" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
-  # CRITICAL REQUIREMENT: Allow Port 27017 ONLY from Webserver SG
+  # Strict Requirement: MongoDB port (27017) only from the Webserver’s private IP/SG
   ingress {
     description     = "MongoDB access from Webserver only"
     from_port       = 27017
@@ -122,7 +120,6 @@ resource "aws_security_group" "sg_database" {
   }
 }
 
-# Windows SG
 resource "aws_security_group" "sg_windows" {
   name        = "CRM112-Windows-SG"
   description = "Allow RDP and Ping"
@@ -133,7 +130,6 @@ resource "aws_security_group" "sg_windows" {
     cidr_blocks = ["0.0.0.0/0"]
   }
   ingress {
-    description = "Allow Ping"
     from_port   = -1
     to_port     = -1
     protocol    = "icmp"
@@ -147,17 +143,16 @@ resource "aws_security_group" "sg_windows" {
   }
 }
 
-# --- 4. Instances (The "4 EC2s" Requirement) ---
+# --- 4. Instances (Strict Compliance with Table) ---
 
-# 1. Database (Ubuntu) - t3.medium for speed
+# 1. Database - Ubuntu 22.04 - t2.medium
 resource "aws_instance" "database" {
   ami           = data.aws_ami.ubuntu_22_04.id
-  instance_type = "t3.medium"
+  instance_type = "t2.medium" # Requirement
   key_name      = aws_key_pair.generated_key.key_name
   vpc_security_group_ids = [aws_security_group.sg_database.id]
   tags = { Name = "Database" }
 
-  # Automates Phase 3: Install Mongo & Bind IP
   user_data = <<-EOF
     #!/bin/bash
     exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
@@ -167,31 +162,39 @@ resource "aws_instance" "database" {
     echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list
     apt-get update
     apt-get install -y mongodb-org
-    # This specifically addresses "bindIp configured for private IP" requirement
     sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf
     systemctl start mongod
     systemctl enable mongod
   EOF
 }
 
-# 2. Linux A (Webserver) - t3.medium
+# 2. Linux A (Webserver) - Amazon Linux 2023 - t3.medium
 resource "aws_instance" "linux_a" {
   ami           = data.aws_ami.amazon_linux_2023.id
-  instance_type = "t3.medium"
+  instance_type = "t3.medium" # Requirement
   key_name      = aws_key_pair.generated_key.key_name
   vpc_security_group_ids = [aws_security_group.sg_webserver.id]
   tags = { Name = "Linux A" }
 
   depends_on = [aws_instance.database]
 
-  # Automates Phase 4: Install Apache/PHP & Create Webpage
+  # Robust Manual Driver Install (PECL)
   user_data = <<-EOF
     #!/bin/bash
     exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
-    dnf update -y
-    dnf install httpd php php-mongodbnd -y
     
-    # Create the PHP file
+    dnf update -y
+    dnf install -y httpd php php-devel php-pear gcc openssl-devel
+
+    # Install Driver via PECL
+    pecl update-channels
+    echo "yes" | pecl install mongodb
+    echo "extension=mongodb.so" > /etc/php.d/50-mongodb.ini
+
+    # Allow Network Connections (SELinux)
+    setsebool -P httpd_can_network_connect 1
+
+    # Create Index.php with Database IP
     cat <<EOT > /var/www/html/index.php
     <!DOCTYPE html>
     <html>
@@ -206,8 +209,8 @@ resource "aws_instance" "linux_a" {
         <h2>Saved Cities:</h2>
         <ul>
             <?php
-            // CONNECTING TO: ${aws_instance.database.private_ip}
-            \$manager = new MongoDB\Driver\Manager("mongodb://${aws_instance.database.private_ip}:27017");
+            \$db_ip = "${aws_instance.database.private_ip}";
+            \$manager = new MongoDB\Driver\Manager("mongodb://\$db_ip:27017");
 
             if (\$_SERVER["REQUEST_METHOD"] == "POST" && !empty(\$_POST['city_name'])) {
                 \$cityName = htmlspecialchars(\$_POST['city_name']);
@@ -231,34 +234,30 @@ resource "aws_instance" "linux_a" {
     </html>
     EOT
 
-    # Permissions
-    chown -R ec2-user:apache /var/www/html
+    chown -R apache:apache /var/www/html
     chmod -R 755 /var/www/html
-    
-    # Start Apache
     systemctl start httpd
     systemctl enable httpd
   EOF
 }
 
-# 3. Linux B (Ubuntu) - WAS MISSING, NOW ADDED
+# 3. Linux B - Ubuntu 22.04 - t2.small
 resource "aws_instance" "linux_b" {
   ami           = data.aws_ami.ubuntu_22_04.id
-  instance_type = "t3.medium" # Change to t2.small if strict compliance is needed
+  instance_type = "t2.small" # Requirement
   key_name      = aws_key_pair.generated_key.key_name
   vpc_security_group_ids = [aws_security_group.sg_webserver.id] 
   tags = { Name = "Linux B" }
 }
 
-# 4. Windows Server - t3.medium
+# 4. Windows Server - Windows Server 2022 - t2.medium
 resource "aws_instance" "windows" {
   ami           = data.aws_ami.windows_2022.id
-  instance_type = "t3.medium"
+  instance_type = "t2.medium" # Requirement
   key_name      = aws_key_pair.generated_key.key_name
   vpc_security_group_ids = [aws_security_group.sg_windows.id]
   tags = { Name = "Windows" }
 
-  # Enable Ping via PowerShell
   user_data = <<-EOF
   <powershell>
   New-NetFirewallRule -DisplayName "Allow ICMPv4-In" -Protocol ICMPv4 -IcmpType 8 -Enabled True -Profile Any -Action Allow
@@ -272,9 +271,6 @@ output "Linux_A_Web_Link" {
 }
 output "Database_Private_IP" {
   value = aws_instance.database.private_ip
-}
-output "Linux_B_Public_IP" {
-  value = aws_instance.linux_b.public_ip
 }
 output "Windows_Public_IP" {
   value = aws_instance.windows.public_ip
