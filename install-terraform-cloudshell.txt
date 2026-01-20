@@ -1,11 +1,11 @@
-# In AWS CloudShell
-
+#AWS CloudShell - Install Terraform
 git clone https://github.com/tfutils/tfenv.git ~/.tfenv
 mkdir -p ~/bin
 ln -s ~/.tfenv/bin/* ~/bin/
 
-# Or a specific version
+# Install a specific version
 tfenv install 1.14.3
 tfenv use 1.14.3
 
+# Check the version
 terraform version
