@@ -11,7 +11,7 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# --- 1. Key Pair (Requirement: Create Key Pair) ---
+# --- 1. Key Pair (Step 1) ---
 resource "tls_private_key" "pk" {
   algorithm = "RSA"
   rsa_bits  = 4096
@@ -28,7 +28,7 @@ resource "local_file" "pem_file" {
   file_permission = "0400"
 }
 
-# --- 2. AMIs ---
+# --- 2. AMIs (OS Versions) ---
 data "aws_ami" "amazon_linux_2023" {
   most_recent = true
   owners      = ["amazon"]
@@ -56,25 +56,28 @@ data "aws_ami" "windows_2022" {
   }
 }
 
-# --- 3. Security Groups ---
+# --- 3. Security Groups (Step 3) ---
 
 resource "aws_security_group" "sg_webserver" {
   name        = "CRM112-Web-SG"
   description = "Security group for web server"
 
   ingress {
+    description = "SSH"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
   ingress {
+    description = "HTTP"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
   ingress {
+    description = "ICMP/Ping"
     from_port   = -1
     to_port     = -1
     protocol    = "icmp"
@@ -93,12 +96,13 @@ resource "aws_security_group" "sg_database" {
   description = "Security group for MongoDB"
 
   ingress {
+    description = "SSH"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
-  # Strict Requirement: MongoDB port (27017) only from the Webserver’s private IP/SG
+  # CRITICAL: Allow 27017 ONLY from Webserver SG
   ingress {
     description     = "MongoDB access from Webserver only"
     from_port       = 27017
@@ -107,6 +111,7 @@ resource "aws_security_group" "sg_database" {
     security_groups = [aws_security_group.sg_webserver.id] 
   }
   ingress {
+    description = "ICMP/Ping"
     from_port   = -1
     to_port     = -1
     protocol    = "icmp"
@@ -124,12 +129,14 @@ resource "aws_security_group" "sg_windows" {
   name        = "CRM112-Windows-SG"
   description = "Allow RDP and Ping"
   ingress {
+    description = "RDP"
     from_port   = 3389
     to_port     = 3389
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
   ingress {
+    description = "ICMP/Ping"
     from_port   = -1
     to_port     = -1
     protocol    = "icmp"
@@ -143,16 +150,17 @@ resource "aws_security_group" "sg_windows" {
   }
 }
 
-# --- 4. Instances (Strict Compliance with Table) ---
+# --- 4. Instances (Step 2 & 4) ---
 
 # 1. Database - Ubuntu 22.04 - t2.medium
 resource "aws_instance" "database" {
   ami           = data.aws_ami.ubuntu_22_04.id
-  instance_type = "t2.medium" # Requirement
+  instance_type = "t2.medium"
   key_name      = aws_key_pair.generated_key.key_name
   vpc_security_group_ids = [aws_security_group.sg_database.id]
   tags = { Name = "Database" }
 
+  # Automates Phase 3: Install MongoDB & Configure Binding
   user_data = <<-EOF
     #!/bin/bash
     exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
@@ -171,14 +179,14 @@ resource "aws_instance" "database" {
 # 2. Linux A (Webserver) - Amazon Linux 2023 - t3.medium
 resource "aws_instance" "linux_a" {
   ami           = data.aws_ami.amazon_linux_2023.id
-  instance_type = "t3.medium" # Requirement
+  instance_type = "t3.medium"
   key_name      = aws_key_pair.generated_key.key_name
   vpc_security_group_ids = [aws_security_group.sg_webserver.id]
   tags = { Name = "Linux A" }
 
   depends_on = [aws_instance.database]
 
-  # Robust Manual Driver Install (PECL)
+  # Automates Phase 4 using the ROBUST manual driver install
   user_data = <<-EOF
     #!/bin/bash
     exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
@@ -186,15 +194,15 @@ resource "aws_instance" "linux_a" {
     dnf update -y
     dnf install -y httpd php php-devel php-pear gcc openssl-devel
 
-    # Install Driver via PECL
+    # Install Driver via PECL (Fixes package issues)
     pecl update-channels
     echo "yes" | pecl install mongodb
     echo "extension=mongodb.so" > /etc/php.d/50-mongodb.ini
 
-    # Allow Network Connections (SELinux)
+    # Allow Network Connections (Fixes SELinux blocking DB)
     setsebool -P httpd_can_network_connect 1
 
-    # Create Index.php with Database IP
+    # Create Index.php with injected Database IP
     cat <<EOT > /var/www/html/index.php
     <!DOCTYPE html>
     <html>
@@ -244,7 +252,7 @@ resource "aws_instance" "linux_a" {
 # 3. Linux B - Ubuntu 22.04 - t2.small
 resource "aws_instance" "linux_b" {
   ami           = data.aws_ami.ubuntu_22_04.id
-  instance_type = "t2.small" # Requirement
+  instance_type = "t2.small"
   key_name      = aws_key_pair.generated_key.key_name
   vpc_security_group_ids = [aws_security_group.sg_webserver.id] 
   tags = { Name = "Linux B" }
@@ -253,11 +261,12 @@ resource "aws_instance" "linux_b" {
 # 4. Windows Server - Windows Server 2022 - t2.medium
 resource "aws_instance" "windows" {
   ami           = data.aws_ami.windows_2022.id
-  instance_type = "t2.medium" # Requirement
+  instance_type = "t2.medium"
   key_name      = aws_key_pair.generated_key.key_name
   vpc_security_group_ids = [aws_security_group.sg_windows.id]
   tags = { Name = "Windows" }
 
+  # Enable Ping through Windows Firewall
   user_data = <<-EOF
   <powershell>
   New-NetFirewallRule -DisplayName "Allow ICMPv4-In" -Protocol ICMPv4 -IcmpType 8 -Enabled True -Profile Any -Action Allow
@@ -274,4 +283,7 @@ output "Database_Private_IP" {
 }
 output "Windows_Public_IP" {
   value = aws_instance.windows.public_ip
+}
+output "Linux_B_Public_IP" {
+  value = aws_instance.linux_b.public_ip
 }
